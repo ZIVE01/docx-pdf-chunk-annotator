@@ -231,6 +231,7 @@ export default function PdfChunkHighlighter({
   const renderTaskRef = useRef(null)
   const pdfRef = useRef(null)
   const autoCreatedRef = useRef(new Set())
+  const autoSuppressedRef = useRef(new Set())
 
   const [totalPages, setTotalPages] = useState(0)
   const [currentPage, setCurrentPage] = useState(1)
@@ -253,6 +254,39 @@ export default function PdfChunkHighlighter({
   const pageHeight = viewport ? viewport.height / scale : 0
 
   const renderPageRef = useRef(null)
+  const sourceKey = pdfUrl || docId || 'manual'
+
+  const autoStateKey = useCallback((chunkIndex) => `${sourceKey}:${chunkIndex}`, [sourceKey])
+
+  const isAutoSuppressed = useCallback((key) => {
+    if (autoSuppressedRef.current.has(key)) return true
+    try {
+      return window.sessionStorage.getItem(`pdf-region-auto-suppressed:${key}`) === '1'
+    } catch {
+      return false
+    }
+  }, [])
+
+  const suppressAutoRegion = useCallback((chunkIndex) => {
+    const key = autoStateKey(chunkIndex)
+    autoCreatedRef.current.add(key)
+    autoSuppressedRef.current.add(key)
+    try {
+      window.sessionStorage.setItem(`pdf-region-auto-suppressed:${key}`, '1')
+    } catch {
+      // Ignore storage restrictions; the in-memory ref still works until unmount.
+    }
+  }, [autoStateKey])
+
+  const allowAutoRegion = useCallback((chunkIndex) => {
+    const key = autoStateKey(chunkIndex)
+    autoSuppressedRef.current.delete(key)
+    try {
+      window.sessionStorage.removeItem(`pdf-region-auto-suppressed:${key}`)
+    } catch {
+      // Ignore storage restrictions.
+    }
+  }, [autoStateKey])
 
   useEffect(() => {
     const sourceUrl = pdfUrl || (docId ? `/documents/${docId}/pdf` : null)
@@ -291,7 +325,7 @@ export default function PdfChunkHighlighter({
 
   useEffect(() => {
     const firstRegion = normalizeRegions(activeChunk?.bbox)[0]
-    const page = Number(firstRegion?.page || activeChunk?.page_number)
+    const page = Number(firstRegion?.page)
     if (page > 0) setCurrentPage(page)
   }, [activeChunk?.chunk_index, docId])
 
@@ -355,9 +389,10 @@ export default function PdfChunkHighlighter({
       bbox: makeRegionsBbox(regions),
       page_number: Number(nextRect.page) || currentPage,
     })
-  }, [chunks, currentPage, onChunkGeometryChange, pageHeight, pageWidth])
+    allowAutoRegion(chunkIndex)
+  }, [allowAutoRegion, chunks, currentPage, onChunkGeometryChange, pageHeight, pageWidth])
 
-  const ensureActiveRect = async () => {
+  const ensureActiveRect = async ({ autoSearch = false } = {}) => {
     if (!activeChunk || !pageWidth || !pageHeight) return
     const regions = normalizeRegions(activeChunk.bbox)
     const currentRegionIndex = regions.findIndex((region) => Number(region.page) === currentPage)
@@ -368,32 +403,36 @@ export default function PdfChunkHighlighter({
       return
     }
 
-    setAutoStatus('Searching for chunk text in the PDF...')
-    const detected = await findChunkRectInPdf(pdfRef.current, activeChunk, regions.length > 0 ? currentPage : null)
-    if (detected) {
-      setCurrentPage(detected.page)
-      const targetIndex = regions.findIndex((region) => Number(region.page) === detected.page)
-      setChunkRegion(activeChunk.chunk_index, targetIndex, detected)
-      setAutoStatus(`Region found automatically: page ${detected.page}`)
-      return
+    if (autoSearch) {
+      setAutoStatus('Searching for chunk text in the PDF...')
+      const detected = await findChunkRectInPdf(pdfRef.current, activeChunk, regions.length > 0 ? currentPage : null)
+      if (detected) {
+        setCurrentPage(detected.page)
+        const targetIndex = regions.findIndex((region) => Number(region.page) === detected.page)
+        setChunkRegion(activeChunk.chunk_index, targetIndex, detected)
+        setAutoStatus(`Region found automatically: page ${detected.page}`)
+        return
+      }
     }
 
     const rect = defaultRect(pageWidth, pageHeight, currentPage)
     setChunkRegion(activeChunk.chunk_index, -1, rect)
-    setAutoStatus('Text was not found; a region was placed for manual adjustment')
+    setAutoStatus(autoSearch
+      ? 'Text was not found; a region was placed for manual adjustment'
+      : `Region created on the current page: ${currentPage}`)
   }
 
   useEffect(() => {
     if (!activeChunk || !viewport || !pdfRef.current) return
     if (normalizeRegions(activeChunk.bbox).length > 0) return
 
-    const sourceKey = pdfUrl || docId || 'manual'
     const key = `${sourceKey}:${activeChunk.chunk_index}`
     if (autoCreatedRef.current.has(key)) return
+    if (isAutoSuppressed(key)) return
 
     autoCreatedRef.current.add(key)
-    ensureActiveRect()
-  }, [activeChunk?.chunk_index, activeChunk?.bbox, docId, pdfUrl, viewport])
+    ensureActiveRect({ autoSearch: true })
+  }, [activeChunk?.chunk_index, activeChunk?.bbox, docId, isAutoSuppressed, pdfUrl, sourceKey, viewport])
 
   const removeActiveRect = () => {
     if (!activeChunk) return
@@ -402,6 +441,11 @@ export default function PdfChunkHighlighter({
     if (removeIndex < 0) return
 
     const nextRegions = regions.filter((_, index) => index !== removeIndex)
+    if (nextRegions.length === 0) {
+      suppressAutoRegion(activeChunk.chunk_index)
+    } else {
+      allowAutoRegion(activeChunk.chunk_index)
+    }
     onChunkGeometryChange(activeChunk.chunk_index, {
       bbox: makeRegionsBbox(nextRegions),
       page_number: nextRegions[0]?.page || activeChunk.page_number || null,
@@ -520,7 +564,7 @@ export default function PdfChunkHighlighter({
 
         <div className="h-4 w-px mx-1" style={{ background: 'rgba(241,239,228,0.12)' }} />
         <button
-          onClick={ensureActiveRect}
+          onClick={() => ensureActiveRect({ autoSearch: false })}
           disabled={!activeChunk || !viewport}
           className="btn h-8 px-3 flex items-center gap-2 text-xs disabled:opacity-40"
         >
