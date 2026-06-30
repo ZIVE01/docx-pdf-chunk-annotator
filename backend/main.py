@@ -36,6 +36,7 @@ class ChunkIn(BaseModel):
     chunk_index: int
     chunk_type: str = "text"
     section_title: str | None = None
+    context_title: str | None = None
     table_title: str | None = None
     table_number: str | None = None
     page_number: int | None = None
@@ -223,4 +224,3 @@ def save_annotation(preview_id: str, payload: SaveAnnotationIn):
         "chunks_saved": len(payload.chunks),
         "pdf_saved": pdf_saved,
     }
-

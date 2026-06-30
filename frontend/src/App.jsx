@@ -20,6 +20,24 @@ const CHUNK_TYPE_LABELS = {
   equation: 'Equation',
 }
 
+const AUTO_TEXT_CHUNK_MAX_CHARS = 900
+const AUTO_DETAIL_ITEM_MAX_CHARS = 320
+
+function isContextIntro(text) {
+  return /[:：]\s*$/.test(String(text || '').trim())
+}
+
+function isNumberedParagraph(text) {
+  return /^\s*\d+(?:\.\d+){1,}\.?\s+/.test(String(text || ''))
+}
+
+function isDetailItem(text) {
+  const value = String(text || '').trim()
+  if (!value) return false
+  if (value.length > AUTO_DETAIL_ITEM_MAX_CHARS) return false
+  return /[;:]$/.test(value) || /^[\u0430-\u044f\u0451a-z]/i.test(value) || /^[-\u2013\u2014\u2022]/.test(value)
+}
+
 function exportBaseName(fileName) {
   return (fileName || 'document').replace(/\.[^/.]+$/, '') || 'document'
 }
@@ -87,7 +105,7 @@ function DocxTable({ rows }) {
   )
 }
 
-function DocumentBlock({ block, selected, assignedChunk, onToggle }) {
+function DocumentBlock({ block, selected, assignedChunk, onToggle, onChunkSelect }) {
   const disabled = assignedChunk !== undefined
   const isHeading = block.role === 'heading'
   const isTable = block.type === 'table'
@@ -96,10 +114,13 @@ function DocumentBlock({ block, selected, assignedChunk, onToggle }) {
     <button
       type="button"
       onClick={() => {
-        if (!disabled) onToggle(block.id)
+        if (disabled) {
+          onChunkSelect?.(assignedChunk)
+          return
+        }
+        onToggle(block.id)
       }}
-      disabled={disabled}
-      className="w-full text-left transition-colors disabled:cursor-default"
+      className="w-full text-left transition-colors"
       style={{
         padding: isTable ? '14px' : '10px 14px',
         borderLeft: assignedChunk !== undefined
@@ -114,6 +135,7 @@ function DocumentBlock({ block, selected, assignedChunk, onToggle }) {
             ? 'rgba(241,239,228,0.08)'
             : 'transparent',
         opacity: disabled ? 0.72 : 1,
+        cursor: 'pointer',
       }}
     >
       <div className="flex items-start gap-2">
@@ -158,8 +180,11 @@ export default function App() {
   const [chunks, setChunks] = useState([])
   const [activeChunkIndex, setActiveChunkIndex] = useState(null)
   const [previewMode, setPreviewMode] = useState('docx')
+  const [pdfCurrentPage, setPdfCurrentPage] = useState(1)
+  const [pdfAutoPlaceRequest, setPdfAutoPlaceRequest] = useState(0)
   const [chunkType, setChunkType] = useState('text')
   const [sectionTitle, setSectionTitle] = useState('')
+  const [contextTitle, setContextTitle] = useState('')
   const [tableTitle, setTableTitle] = useState('')
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
@@ -184,6 +209,22 @@ export default function App() {
     return result
   }, [chunks])
 
+  const activeChunk = useMemo(
+    () => chunks.find((chunk) => chunk.chunk_index === activeChunkIndex) || null,
+    [activeChunkIndex, chunks],
+  )
+
+  const selectChunk = (chunkIndex) => {
+    const chunk = chunks.find((item) => item.chunk_index === chunkIndex)
+    if (!chunk) return
+
+    setActiveChunkIndex(chunk.chunk_index)
+    setChunkType(chunk.chunk_type || 'text')
+    setSectionTitle(chunk.section_title || '')
+    setContextTitle(chunk.context_title || '')
+    setTableTitle(chunk.table_title || '')
+  }
+
   const resetDocument = () => {
     setPreviewId('')
     setPreviewPdfUrl('')
@@ -192,6 +233,9 @@ export default function App() {
     setSelectedIds([])
     setChunks([])
     setActiveChunkIndex(null)
+    setPdfCurrentPage(1)
+    setPdfAutoPlaceRequest(0)
+    setContextTitle('')
     setPreviewMode('docx')
   }
 
@@ -234,6 +278,33 @@ export default function App() {
     ))
   }
 
+  const buildChunkPayload = (chunkBlocks, options = {}) => {
+    const first = chunkBlocks[0]
+    const firstTableBlock = chunkBlocks.find((block) => block.type === 'table')
+    const type = options.chunkType || chunkType
+    const isSingleTable = chunkBlocks.length === 1 && first?.type === 'table'
+    const finalType = isSingleTable ? 'table' : type
+    const finalSection = options.sectionTitle ?? ((sectionTitle || '').trim() || first?.section_title || null)
+    const finalContext = options.contextTitle ?? ((contextTitle || '').trim() || null)
+    const finalTableTitle = finalType === 'table'
+      ? (options.tableTitle || (tableTitle || '').trim() || firstTableBlock?.table_title || first?.table_title || finalSection || 'Table')
+      : null
+
+    return {
+      chunk_type: finalType,
+      section_title: finalSection,
+      context_title: finalContext,
+      table_title: finalTableTitle,
+      table_number: finalType === 'table'
+        ? (options.tableNumber || firstTableBlock?.table_number || first?.table_number || null)
+        : null,
+      page_number: first?.page_number || null,
+      text: chunkBlocks.map((block) => block.text || '').filter(Boolean).join('\n\n'),
+      bbox: null,
+      block_ids: chunkBlocks.map((block) => block.id),
+    }
+  }
+
   const createChunk = () => {
     if (!selectedBlocks.length) {
       toast.error('Select blocks first')
@@ -246,26 +317,162 @@ export default function App() {
       return
     }
 
-    const section = (sectionTitle || selectedBlocks[0]?.section_title || '').trim()
-    const title = (tableTitle || selectedBlocks.find((block) => block.table_title)?.table_title || '').trim()
-    const text = selectedBlocks.map((block) => block.text).join('\n\n').trim()
     const nextIndex = chunks.length
     const nextChunk = {
       chunk_index: nextIndex,
-      chunk_type: chunkType,
-      section_title: section || null,
-      table_title: chunkType === 'table' ? title || null : null,
-      table_number: selectedBlocks.find((block) => block.table_number)?.table_number || null,
-      page_number: selectedBlocks[0]?.page_number || null,
-      text,
-      bbox: null,
-      block_ids: selectedBlocks.map((block) => block.id),
+      ...buildChunkPayload(selectedBlocks),
     }
 
     setChunks((prev) => [...prev, nextChunk])
     setSelectedIds([])
+    setContextTitle('')
     setActiveChunkIndex(nextIndex)
     toast.success(`Chunk #${nextIndex} created`)
+  }
+
+  const updateActiveChunkSettings = () => {
+    if (!activeChunk) {
+      toast.error('Select a chunk first')
+      return
+    }
+
+    const nextType = chunkType || activeChunk.chunk_type || 'text'
+    setChunks((prev) => prev.map((chunk) => (
+      chunk.chunk_index === activeChunk.chunk_index
+        ? {
+            ...chunk,
+            chunk_type: nextType,
+            section_title: sectionTitle.trim() || null,
+            context_title: contextTitle.trim() || null,
+            table_title: nextType === 'table' ? (tableTitle.trim() || null) : null,
+            table_number: nextType === 'table' ? chunk.table_number : null,
+          }
+        : chunk
+    )))
+    toast.success(`Chunk #${activeChunk.chunk_index} updated`)
+  }
+
+  const deleteActiveChunk = () => {
+    if (!activeChunk) {
+      toast.error('Select a chunk first')
+      return
+    }
+    deleteChunk(activeChunk.chunk_index)
+    setSectionTitle('')
+    setContextTitle('')
+    setTableTitle('')
+  }
+
+  const createAutoDraftChunks = () => {
+    if (!blocks.length) {
+      toast.error('Open a DOCX first')
+      return
+    }
+    if (chunks.length && !confirm('Replace current chunks with an automatic draft?')) return
+
+    const draft = []
+    let currentBlocks = []
+    let currentSection = null
+    let currentLength = 0
+    let activeContext = null
+    let activeContextSection = null
+
+    const pushDraft = (payload) => {
+      draft.push({
+        chunk_index: draft.length,
+        ...payload,
+        bbox: null,
+      })
+    }
+
+    const flushText = () => {
+      if (!currentBlocks.length) return
+      pushDraft(buildChunkPayload(currentBlocks, {
+        chunkType: 'text',
+        sectionTitle: currentBlocks[0]?.section_title || currentSection || null,
+      }))
+      currentBlocks = []
+      currentSection = null
+      currentLength = 0
+    }
+
+    blocks.forEach((block) => {
+      if (block.type === 'table') {
+        flushText()
+        activeContext = null
+        activeContextSection = null
+        pushDraft(buildChunkPayload([block], {
+          chunkType: 'table',
+          sectionTitle: block.section_title || null,
+          tableTitle: block.table_title || block.section_title || 'Table',
+          tableNumber: block.table_number || null,
+        }))
+        return
+      }
+
+      const blockText = block.text || ''
+      const blockTextLength = (block.text || '').length
+      const blockSection = block.section_title || null
+      const numbered = isNumberedParagraph(blockText)
+      const contextIntro = isContextIntro(blockText)
+      const detailedItem = activeContext && activeContextSection === blockSection && isDetailItem(blockText)
+      const sectionChanged = currentBlocks.length > 0 && blockSection !== currentSection
+      const startsNewHeading = block.role === 'heading' && currentBlocks.length > 0
+      const startsNumbered = numbered && currentBlocks.length > 0
+      const tooLong = currentBlocks.length > 0 && currentLength + blockTextLength > AUTO_TEXT_CHUNK_MAX_CHARS
+
+      if (detailedItem) {
+        flushText()
+        pushDraft(buildChunkPayload([block], {
+          chunkType: 'text',
+          sectionTitle: blockSection,
+          contextTitle: activeContext,
+        }))
+        return
+      }
+
+      if (sectionChanged || startsNewHeading || startsNumbered || tooLong) flushText()
+      if (!currentBlocks.length) currentSection = blockSection
+
+      currentBlocks.push(block)
+      currentLength += blockTextLength + 2
+
+      if (contextIntro) {
+        flushText()
+        activeContext = blockText
+        activeContextSection = blockSection
+      } else if (block.role === 'heading' || numbered) {
+        activeContext = null
+        activeContextSection = null
+      }
+    })
+
+    flushText()
+
+    setChunks(draft)
+    setSelectedIds([])
+    setActiveChunkIndex(draft.length ? 0 : null)
+    setChunkType(draft[0]?.chunk_type || 'text')
+    setSectionTitle(draft[0]?.section_title || '')
+    setContextTitle(draft[0]?.context_title || '')
+    setTableTitle(draft[0]?.table_title || '')
+    setPdfAutoPlaceRequest(0)
+    toast.success(`Auto chunks: ${draft.length}`)
+  }
+
+  const confirmChunksForPdf = () => {
+    if (!chunks.length) {
+      toast.error('No chunks for PDF annotation')
+      return
+    }
+    if (!previewPdfUrl) {
+      toast.error('PDF preview is not available')
+      return
+    }
+    if (!confirm('Have you reviewed the chunks? Start PDF region search for chunks without regions?')) return
+
+    setPreviewMode('pdf')
+    setPdfAutoPlaceRequest((value) => value + 1)
   }
 
   const deleteChunk = (chunkIndex) => {
@@ -274,7 +481,16 @@ export default function App() {
         .filter((chunk) => chunk.chunk_index !== chunkIndex)
         .map((chunk, index) => ({ ...chunk, chunk_index: index }))
     ))
-    setActiveChunkIndex(null)
+    setActiveChunkIndex((current) => {
+      if (current === chunkIndex) {
+        setSectionTitle('')
+        setContextTitle('')
+        setTableTitle('')
+        return null
+      }
+      if (current > chunkIndex) return current - 1
+      return current
+    })
   }
 
   const updateChunkGeometry = (chunkIndex, updates) => {
@@ -398,6 +614,16 @@ export default function App() {
           </div>
 
           <div>
+            <label className="mb-1.5 block text-xs text-ak-fog/45">Context</label>
+            <input
+              value={contextTitle}
+              onChange={(e) => setContextTitle(e.target.value)}
+              placeholder="Context for embedding"
+              className="input"
+            />
+          </div>
+
+          <div>
             <label className="mb-1.5 block text-xs text-ak-fog/45">Table title</label>
             <input
               value={tableTitle}
@@ -405,6 +631,50 @@ export default function App() {
               placeholder={selectedBlocks[0]?.table_title || 'For table chunks'}
               className="input"
             />
+          </div>
+
+          <div
+            className="rounded-md px-2 py-2 text-xs"
+            style={{ background: activeChunk ? 'rgba(34,197,94,0.08)' : 'rgba(241,239,228,0.05)' }}
+          >
+            <div className="text-ak-fog/45">
+              {activeChunk ? `Editing chunk #${activeChunk.chunk_index}` : 'No chunk selected for editing'}
+            </div>
+            {activeChunk && (
+              <div className="mt-1 line-clamp-2 text-ak-fog/65">
+                {activeChunk.text}
+              </div>
+            )}
+          </div>
+
+          <div className="grid grid-cols-2 gap-2">
+            <button
+              onClick={updateActiveChunkSettings}
+              disabled={!activeChunk}
+              className="btn h-10 gap-2 disabled:opacity-40"
+            >
+              <Save size={16} />
+              Update
+            </button>
+            <button
+              onClick={deleteActiveChunk}
+              disabled={!activeChunk}
+              className="btn-ghost h-10 gap-2 text-red-200 disabled:opacity-40"
+            >
+              <Trash2 size={16} />
+              Delete
+            </button>
+          </div>
+
+          <div className="grid grid-cols-2 gap-2">
+            <button onClick={createAutoDraftChunks} className="btn-primary h-10 gap-2">
+              <Layers size={16} />
+              Auto chunks
+            </button>
+            <button onClick={confirmChunksForPdf} className="btn h-10 gap-2">
+              <CheckSquare size={16} />
+              PDF regions
+            </button>
           </div>
 
           <div className="grid grid-cols-3 gap-2">
@@ -429,8 +699,9 @@ export default function App() {
               type="button"
               key={chunk.chunk_index}
               onClick={() => {
-                setActiveChunkIndex(chunk.chunk_index)
-                setPreviewMode('pdf')
+                selectChunk(chunk.chunk_index)
+                if (previewMode === 'pdf') return
+                setPreviewMode('docx')
               }}
               className="w-full p-3 text-left transition-colors hover:bg-ak-fog/5"
               style={{
@@ -482,28 +753,29 @@ export default function App() {
           </span>
         </div>
 
-        {previewMode === 'docx' ? (
-          <div className="min-h-0 flex-1 overflow-y-auto p-6">
+        <div className="min-h-0 flex-1 overflow-hidden">
+          <div className={previewMode === 'docx' ? 'h-full overflow-y-auto p-6' : 'hidden h-full overflow-y-auto p-6'}>
             <div className="mx-auto max-w-5xl overflow-hidden rounded-md" style={{ border: '1px solid rgba(241,239,228,0.10)' }}>
-              {blocks.length === 0 ? (
-                <div className="flex h-[420px] items-center justify-center text-sm text-ak-fog/40">
-                  Open a DOCX file to start annotation
-                </div>
-              ) : (
-                blocks.map((block) => (
-                  <DocumentBlock
-                    key={block.id}
-                    block={block}
-                    selected={selectedIds.includes(block.id)}
-                    assignedChunk={assignedByBlockId.get(block.id)}
-                    onToggle={toggleBlock}
-                  />
-                ))
-              )}
+                {blocks.length === 0 ? (
+                  <div className="flex h-[420px] items-center justify-center text-sm text-ak-fog/40">
+                    Open a DOCX file to start annotation
+                  </div>
+                ) : (
+                  blocks.map((block) => (
+                    <DocumentBlock
+                      key={block.id}
+                      block={block}
+                      selected={selectedIds.includes(block.id)}
+                      assignedChunk={assignedByBlockId.get(block.id)}
+                      onToggle={toggleBlock}
+                      onChunkSelect={selectChunk}
+                    />
+                  ))
+                )}
             </div>
           </div>
-        ) : (
-          <div className="min-h-0 flex-1">
+
+          <div className={previewMode === 'pdf' ? 'h-full' : 'hidden h-full'}>
             {previewPdfUrl ? (
               <PdfChunkHighlighter
                 docId={null}
@@ -512,6 +784,10 @@ export default function App() {
                 activeChunkIndex={activeChunkIndex}
                 onActiveChunkChange={setActiveChunkIndex}
                 onChunkGeometryChange={updateChunkGeometry}
+                currentPage={pdfCurrentPage}
+                onCurrentPageChange={setPdfCurrentPage}
+                active={previewMode === 'pdf'}
+                autoPlaceRequest={pdfAutoPlaceRequest}
               />
             ) : (
               <div className="flex h-full items-center justify-center px-8 text-center text-sm text-ak-fog/45">
@@ -519,7 +795,7 @@ export default function App() {
               </div>
             )}
           </div>
-        )}
+        </div>
       </main>
     </div>
   )
